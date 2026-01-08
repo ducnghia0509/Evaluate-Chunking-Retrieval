@@ -1,0 +1,8 @@
+qdrant-client
+numpy
+pandas
+spacy
+sentence-transformer
+torch
+tiktoken
+bm25

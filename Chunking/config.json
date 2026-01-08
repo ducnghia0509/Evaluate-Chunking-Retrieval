@@ -1,0 +1,45 @@
+{
+  "chunking_strategies": {
+    "fixed": {
+      "type": "fixed",
+      "chunk_size": 512,
+      "chunk_overlap": 64,
+      "unit": "token"
+    },
+
+    "structure_paragraph": {
+      "type": "structure",
+      "strategy": "paragraph",
+      "max_chunk_size": 600,
+      "min_chunk_size": 100,
+      "merge_short_paragraphs": true
+    },
+
+    "hierarchical": {
+      "type": "hierarchical",
+      "levels": ["section", "paragraph", "sentence"],
+      "max_chunk_size": 800,
+      "min_chunk_size": 150,
+      "store_hierarchy": true
+    },
+
+    "parent_child": {
+      "type": "parent_child",
+      "parent_chunk_size": 1000,
+      "child_chunk_size": 250,
+      "child_overlap": 50,
+      "link_strategy": "id_mapping"
+    }
+  },
+
+  "paths": {
+    "markdown_dir": "../../Markdown",
+    "output_dir": "../../Chunked"
+  },
+
+  "evaluation": {
+    "retrieval_k": [1, 3, 5, 10],
+    "metrics": ["recall@k", "mrr", "precision@k", "faithfulness"],
+    "save_chunks": true
+  }
+}

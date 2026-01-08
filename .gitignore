@@ -1,0 +1,9 @@
+*.pdf
+__pycache__/
+logs/
+__init__.py
+venv/
+Chunked/
+Embedd/
+Evaluate/
+Markdown/
