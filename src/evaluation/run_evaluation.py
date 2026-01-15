@@ -54,20 +54,24 @@ QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 COLLECTION_NAME = "evaluate"
 MODEL_NAME = "Alibaba-NLP/gte-multilingual-base"
-EVALUATION_FILE = "../../evaluation.json"
+# EVALUATION_FILE = "../../evaluation.json"
+EVALUATION_FOLDER = "../../splitted_by_category"
 RESULTS_DIR = "../../Evaluate/results"
 
 
 class EvaluationSystem:
     """Evaluation system for RAG with different chunking and retrieval strategies"""
     
-    def __init__(self):
+    def __init__(self, evaluation_file: str = None):
         # Initialize Qdrant client
         self.client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
         
         # Load embedding model
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = SentenceTransformer(MODEL_NAME, device=device, trust_remote_code=True)
+        
+        # Store evaluation file path
+        self.evaluation_file = evaluation_file
         
         # Load evaluation queries
         self.load_evaluation_queries()
@@ -121,11 +125,17 @@ class EvaluationSystem:
     
     def load_evaluation_queries(self):
         """Load evaluation queries from JSON file"""
-        eval_path = Path(EVALUATION_FILE)
-        if eval_path.exists():
-            with open(eval_path, 'r', encoding='utf-8') as f:
-                self.queries = json.load(f)
+        if self.evaluation_file:
+            eval_path = Path(self.evaluation_file)
+            if eval_path.exists():
+                with open(eval_path, 'r', encoding='utf-8') as f:
+                    self.queries = json.load(f)
+                print(f"✓ Loaded {len(self.queries)} queries from {eval_path.name}")
+            else:
+                print(f"⚠️ Evaluation file not found: {eval_path}")
+                self.queries = []
         else:
+            print("⚠️ No evaluation file selected")
             self.queries = []
     
     def enrich_parent_child_context(self, chunks: List[Dict]) -> List[Dict]:
@@ -649,10 +659,10 @@ class EvaluationSystem:
                     match_threshold = 0.2  # Lowered from 0.30 to 0.20
                 elif is_child_chunk:
                     # Normal threshold for child chunks
-                    match_threshold = 0.3
+                    match_threshold = 0.1
                 else:
                     # Normal threshold for other strategies
-                    match_threshold = 0.2
+                    match_threshold = 0.1
                 
                 if best_match and best_overlap > match_threshold:
                     relevance = best_match[1]
@@ -724,13 +734,13 @@ class EvaluationSystem:
                 if is_parent_chunk:
                     # Lower threshold for parent chunks since they're much larger
                     # Even 20% containment means significant overlap
-                    match_threshold = 0.20
+                    match_threshold = 0.2
                 elif is_child_chunk:
                     # Normal threshold for child chunks
-                    match_threshold = 0.4
+                    match_threshold = 0.1
                 else:
                     # Normal threshold for other strategies
-                    match_threshold = 0.4
+                    match_threshold = 0.1
                 
                 if best_match and best_overlap > match_threshold:
                     relevance = best_match[1]
@@ -835,7 +845,7 @@ class EvaluationSystem:
         
         for i, query_item in enumerate(progress.tqdm(self.queries, desc="Evaluating")):
             query_id = query_item['id']
-            query_text = query_item['query']
+            query_text = query_item['question']
             relevant_chunks = query_item.get('relevant_chunks', [])
             
             # Choose retrieval method
@@ -1085,11 +1095,11 @@ class EvaluationSystem:
             summary += f"- Min Total Tokens: **{min_total_tokens}** (for fair comparison)\n"
         
         # Add retrieval statistics
-        avg_chunks_per_query = total_chunks_retrieved / len(self.queries) if self.queries else 0
+        # avg_chunks_per_query = total_chunks_retrieved / len(self.queries) if self.queries else 0
         avg_tokens_per_query = total_tokens_retrieved / len(self.queries) if self.queries else 0
         
         summary += f"\n**Retrieval Statistics:**\n"
-        summary += f"- Avg chunks per query: **{avg_chunks_per_query:.2f}**\n"
+        # summary += f"- Avg chunks per query: **{avg_chunks_per_query:.2f}**\n"
         summary += f"- Avg tokens per query: **{avg_tokens_per_query:.2f}**\n"
         
         if queries_with_no_results > 0:
@@ -1134,9 +1144,9 @@ class EvaluationSystem:
         strategy_key = f"{chunking_strategy}+{retrieval_method}"
         self.comparison_results[strategy_key] = {
             'metrics': avg_metrics,
-            'sum_tokens': total_tokens_retrieved,
-            'sum_chunks': total_chunks_retrieved,
-            'avg_chunks_per_query': avg_chunks_per_query,
+            # 'sum_tokens': total_tokens_retrieved,
+            # 'sum_chunks': total_chunks_retrieved,
+            # 'avg_chunks_per_query': avg_chunks_per_query,
             'avg_tokens_per_query': avg_tokens_per_query,
             'timestamp': datetime.now().isoformat(),
             'top_k': top_k,
@@ -1166,7 +1176,7 @@ class EvaluationSystem:
             Summary text, comparison table, and detailed results
         """
         chunking_strategies = ["fixed", "structure_paragraph", "hierarchical", "parent_child"]
-        all_retrieval_methods = ["dense", "sparse", "hybrid"]
+        all_retrieval_methods = ["dense", "hybrid"]
         
         # Calculate total combinations
         total_combinations = len(chunking_strategies) * len(all_retrieval_methods) + 1  # +1 for parent_child + parent
@@ -1210,7 +1220,7 @@ class EvaluationSystem:
                 except Exception as e:
                     results_summary += f"❌ **{chunking_strategy} + {retrieval_method}**: Error - {str(e)}\n"
                     print(f"Error in {chunking_strategy} + {retrieval_method}: {e}")
-                    traceback.print_exc()
+                    # traceback.print_exc()
         
         # Generate final comparison heatmap and table
         final_comparison_fig = self.generate_comparison_heatmap()
@@ -1238,8 +1248,8 @@ class EvaluationSystem:
             metrics = strategy_data.get('metrics', {})
             row = {
                 'Strategy': strategy_name,
-                'Total Tokens': int(strategy_data.get('sum_tokens', 0)),
-                'Total Chunks': int(strategy_data.get('sum_chunks', 0)),
+                # 'Total Tokens': int(strategy_data.get('sum_tokens', 0)),
+                # 'Total Chunks': int(strategy_data.get('sum_chunks', 0)),
                 'Avg Tokens/Query': f"{strategy_data.get('avg_tokens_per_query', 0):.2f}",
                 'Recall@10': f"{metrics.get('recall@10', 0):.4f}",
                 'Precision@10': f"{metrics.get('precision@10', 0):.4f}",
@@ -1276,14 +1286,14 @@ class EvaluationSystem:
         all_metrics = list(self.comparison_results[first_strategy]['metrics'].keys())
         
         # Add sum_tokens and sum_chunks to metrics
-        all_metrics_extended = all_metrics + ['sum_tokens', 'sum_chunks', 'avg_chunks_per_query', 'avg_tokens_per_query']
+        all_metrics_extended = all_metrics + ['avg_tokens_per_query']
         
         # Create matrix: rows = metrics, columns = strategies
         data_matrix = []
         for metric in all_metrics_extended:
             row = []
             for strategy in strategies:
-                if metric in ['sum_tokens', 'sum_chunks', 'avg_chunks_per_query', 'avg_tokens_per_query']:
+                if metric in ['avg_tokens_per_query']:
                     val = self.comparison_results[strategy].get(metric, 0)
                 else:
                     val = self.comparison_results[strategy]['metrics'].get(metric, 0)
@@ -1306,8 +1316,9 @@ class EvaluationSystem:
         for i, row in enumerate(data_matrix):
             metric = all_metrics_extended[i]
             
-            # For sum_tokens and sum_chunks, lower is better (inverse normalization)
-            if metric in ['sum_tokens', 'sum_chunks']:
+            # Only avg_tokens_per_query: lower is better (inverse normalization)
+            # All other metrics: higher is better (normal normalization)
+            if metric == 'avg_tokens_per_query':
                 min_val = min(row)
                 max_val = max(row)
                 if max_val > min_val:
@@ -1316,10 +1327,11 @@ class EvaluationSystem:
                 else:
                     normalized_row = [0.5] * len(row)
             else:
-                # For other metrics, higher is better (normal normalization)
+                # For all other metrics, higher is better (normal normalization)
                 min_val = min(row)
                 max_val = max(row)
                 if max_val > min_val:
+                    # Normal: higher values get higher scores (greener)
                     normalized_row = [(val - min_val) / (max_val - min_val) for val in row]
                 else:
                     normalized_row = [0.5] * len(row)
@@ -1385,10 +1397,10 @@ class EvaluationSystem:
         
         # Retrieval statistics
         details += f"**Retrieval Statistics:**\n"
-        details += f"- Total Tokens: **{int(strategy_data.get('sum_tokens', 0))}**\n"
-        details += f"- Total Chunks: **{int(strategy_data.get('sum_chunks', 0))}**\n"
+        # details += f"- Total Tokens: **{int(strategy_data.get('sum_tokens', 0))}**\n"
+        # details += f"- Total Chunks: **{int(strategy_data.get('sum_chunks', 0))}**\n"
         details += f"- Avg Tokens/Query: **{strategy_data.get('avg_tokens_per_query', 0):.2f}**\n"
-        details += f"- Avg Chunks/Query: **{strategy_data.get('avg_chunks_per_query', 0):.2f}**\n\n"
+        # details += f"- Avg Chunks/Query: **{strategy_data.get('avg_chunks_per_query', 0):.2f}**\n\n"
         
         # Metrics
         details += f"**Performance Metrics:**\n"
@@ -1397,6 +1409,18 @@ class EvaluationSystem:
             details += f"- {metric_name}: **{metric_value:.4f}**\n"
         
         return details
+    
+    def set_evaluation_file(self, category: str):
+        """Set evaluation file based on category"""
+        if category == "all":
+            self.evaluation_file = str(Path(EVALUATION_FOLDER) / "../evaluation.json")
+        else:
+            self.evaluation_file = str(Path(EVALUATION_FOLDER) / f"evaluation_{category}.json")
+        
+        # Reload queries
+        self.load_evaluation_queries()
+        
+        return f"✓ Loaded {len(self.queries)} queries from category: {category}"
     
     def clear_comparison(self):
         """Clear all comparison results"""
@@ -1467,7 +1491,7 @@ class EvaluationSystem:
         return availability_info
 
 
-# Initialize system
+# Initialize system (will be set when user selects category)
 eval_system = EvaluationSystem()
 
 
@@ -1480,6 +1504,16 @@ def create_dashboard():
         with gr.Row():
             with gr.Column(scale=1):
                 gr.Markdown("### Configuration")
+                
+                # Category selector
+                category_selector = gr.Dropdown(
+                    choices=["doc", "document_law", "fiction", "all"],
+                    value="doc",
+                    label="📁 Evaluation Category",
+                    info="Select which dataset to evaluate"
+                )
+                
+                category_status = gr.Markdown("*Select a category to load evaluation queries*")
                 
                 chunking_strategy = gr.Dropdown(
                     choices=["fixed", "structure_paragraph", "hierarchical", "parent_child"],
@@ -1521,7 +1555,7 @@ def create_dashboard():
                     clear_btn = gr.Button("🗑️ Clear Comparison", variant="secondary", size="lg")
                 
                 run_all_btn = gr.Button("⚡ RUN ALL COMBINATIONS", variant="primary", size="lg")
-                gr.Markdown("*Runs all chunking strategies with all retrieval methods (parent retrieval only with parent_child)*")
+                # gr.Markdown("*Runs all chunking strategies with all retrieval methods (parent retrieval only with parent_child)*")
                 
                 # check_data_btn = gr.Button("🔍 Check Data Availability", variant="secondary")
                 
@@ -1557,13 +1591,14 @@ def create_dashboard():
                         interactive=False,
                         wrap=True
                     )
-                    
-                    gr.Markdown("---")
-                    selected_strategy_details = gr.Markdown(
-                        "Click on a row in the strategy table to see detailed metrics."
-                    )
         
         # Event handlers
+        category_selector.change(
+            fn=eval_system.set_evaluation_file,
+            inputs=[category_selector],
+            outputs=[category_status]
+        )
+        
         def run_with_params(strategy, method, k, min_tokens, max_tokens):
             # Convert 0 to None for auto calculation
             min_tokens_val = None if min_tokens == 0 else int(min_tokens)
@@ -1591,13 +1626,7 @@ def create_dashboard():
         clear_btn.click(
             fn=eval_system.clear_comparison,
             inputs=[],
-            outputs=[clear_status, comparison_plot, strategy_table, selected_strategy_details]
-        )
-        
-        # Handle strategy table row selection to show details
-        strategy_table.select(
-            fn=eval_system.get_strategy_details,
-            outputs=[selected_strategy_details]
+            outputs=[clear_status, comparison_plot, strategy_table]
         )
         
         # check_data_btn.click(
