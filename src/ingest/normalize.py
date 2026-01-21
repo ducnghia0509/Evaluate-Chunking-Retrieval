@@ -19,6 +19,12 @@ def remove_meaningless_hashes(text):
     return text
 
 
+def remove_page_markers(text):
+    """Remove page markers like '--- Page 1 ---', '--- Page 2 ---', etc."""
+    text = re.sub(r'^---\s*Page\s+\d+\s*---\s*$', '', text, flags=re.MULTILINE | re.IGNORECASE)
+    return text
+
+
 def remove_duplicate_header_content(text):
     """
     Remove duplicate content after headers
@@ -94,6 +100,7 @@ def normalize_markdown_file(file_path):
         content = f.read()
     
     # Apply normalizations
+    content = remove_page_markers(content)
     content = remove_empty_lines(content)
     content = remove_meaningless_hashes(content)
     
@@ -127,6 +134,7 @@ def merge_land_law_files():
             merged_content += content + "\n\n"
     
     # Normalize merged content
+    merged_content = remove_page_markers(merged_content)
     merged_content = remove_empty_lines(merged_content)
     merged_content = remove_meaningless_hashes(merged_content)
     

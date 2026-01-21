@@ -77,7 +77,29 @@ def fixed_chunking(markdown_file: Path, config: Dict) -> List[Dict]:
             }
         })
     
-    return chunks
+    # Merge chunks with token count < 50 into previous chunk
+    min_token_threshold = 50
+    merged_chunks = []
+    
+    for i, chunk in enumerate(chunks):
+        token_count = chunk['metadata']['token_count']
+        
+        # If chunk is too small and there's a previous chunk, merge it
+        if token_count < min_token_threshold and merged_chunks:
+            # Merge with previous chunk
+            prev_chunk = merged_chunks[-1]
+            prev_chunk['text'] = prev_chunk['text'] + ' ' + chunk['text']
+            prev_chunk['metadata']['token_count'] = count_tokens(prev_chunk['text'])
+            prev_chunk['metadata']['merged'] = prev_chunk['metadata'].get('merged', 0) + 1
+        else:
+            merged_chunks.append(chunk)
+    
+    # Re-index chunks after merging
+    for idx, chunk in enumerate(merged_chunks):
+        chunk['chunk_id'] = f"{markdown_file.stem}_chunk_{idx}"
+        chunk['chunk_index'] = idx
+    
+    return merged_chunks
 
 
 def process_all_files(config_path: str = "../../Chunking/config.json"):

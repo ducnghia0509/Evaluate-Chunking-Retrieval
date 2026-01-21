@@ -7,3 +7,8 @@ Chunked/
 Embedd/
 Evaluate/
 Markdown/
+splitted_evaluate_by_category/
+colab_embedding.py
+fix
+evaluation_examples/
+# đây là folder chứa các examples cho từng dạng chunking

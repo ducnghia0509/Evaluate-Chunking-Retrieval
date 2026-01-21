@@ -49,13 +49,21 @@ except ImportError:
     HYBRID_RETRIEVAL_AVAILABLE = False
     print("⚠️ HybridRetrieval not available")
 
+# uncomment if you want to run colbert
+# try:
+#     from multivector_retrieval import MultivectorRetrieval
+#     MULTIVECTOR_RETRIEVAL_AVAILABLE = True
+# except ImportError:
+#     MULTIVECTOR_RETRIEVAL_AVAILABLE = False
+#     print("⚠️ MultivectorRetrieval not available")
+
 # Configuration
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 COLLECTION_NAME = "evaluate"
 MODEL_NAME = "Alibaba-NLP/gte-multilingual-base"
 # EVALUATION_FILE = "../../evaluation.json"
-EVALUATION_FOLDER = "../../splitted_by_category"
+EVALUATION_FOLDER = "../../evaluation_examples"
 RESULTS_DIR = "../../Evaluate/results"
 
 
@@ -70,11 +78,11 @@ class EvaluationSystem:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = SentenceTransformer(MODEL_NAME, device=device, trust_remote_code=True)
         
-        # Store evaluation file path
+        # Store evaluation file path (will be set when chunking strategy is selected)
         self.evaluation_file = evaluation_file
         
-        # Load evaluation queries
-        self.load_evaluation_queries()
+        # Initialize empty queries (will load when strategy is selected)
+        self.queries = []
         
         # Store comparison results
         self.comparison_results = {}
@@ -122,6 +130,17 @@ class EvaluationSystem:
                 self.hybrid_retrieval = None
         else:
             self.hybrid_retrieval = None
+        
+        # # Initialize multivector retrieval if available
+        # if MULTIVECTOR_RETRIEVAL_AVAILABLE:
+        #     try:
+        #         self.multivector_retrieval = MultivectorRetrieval()
+        #         print("✓ MultivectorRetrieval initialized")
+        #     except Exception as e:
+        #         print(f"⚠️ Could not initialize MultivectorRetrieval: {e}")
+        #         self.multivector_retrieval = None
+        # else:
+        #     self.multivector_retrieval = None
     
     def load_evaluation_queries(self):
         """Load evaluation queries from JSON file"""
@@ -135,7 +154,6 @@ class EvaluationSystem:
                 print(f"⚠️ Evaluation file not found: {eval_path}")
                 self.queries = []
         else:
-            print("⚠️ No evaluation file selected")
             self.queries = []
     
     def enrich_parent_child_context(self, chunks: List[Dict]) -> List[Dict]:
@@ -260,25 +278,97 @@ class EvaluationSystem:
         
         return enriched_chunks
     
-    def search_qdrant(self, query: str, chunking_strategy: str, top_k: int = 10, 
-                      min_total_tokens: int = None, max_total_tokens: int = None, avg_chunk_tokens: int = 250) -> List[Dict]:
+    def trim_chunks_to_target(self, chunks: List[Dict], target_total_tokens: int = 4500, chunking_strategy: str = '') -> List[Dict]:
         """
-        Search in Qdrant with chunking strategy filter and ensure minimum/maximum total tokens
+        Trim chunks to fit target total tokens
+        
+        Args:
+            chunks: List of chunks to trim
+            target_total_tokens: Target total tokens
+            chunking_strategy: Chunking strategy (for logging)
+        
+        Returns:
+            Trimmed chunks
+        """
+        if not chunks:
+            return chunks
+        
+        # Calculate total tokens
+        total_tokens = 0
+        for chunk in chunks:
+            # Use enriched_tokens for parent_child, otherwise use token_count
+            if 'enriched_tokens' in chunk:
+                chunk_tokens = chunk['enriched_tokens']
+            else:
+                chunk_tokens = chunk.get('metadata', {}).get('token_count', 0)
+                if chunk_tokens == 0:
+                    chunk_tokens = len(chunk.get('text', '')) // 4
+            total_tokens += chunk_tokens
+        
+        # If under target, return as is
+        if total_tokens <= target_total_tokens:
+            # Add summary
+            if chunks:
+                chunks[0]['_retrieval_summary'] = {
+                    'total_chunks': len(chunks),
+                    'total_tokens': total_tokens,
+                    'target_total_tokens': target_total_tokens,
+                    'avg_tokens_per_chunk': total_tokens / len(chunks) if chunks else 0
+                }
+            return chunks
+        
+        # Trim to target
+        trimmed_chunks = []
+        cumulative_tokens = 0
+        for chunk in chunks:
+            # Use enriched_tokens for parent_child, otherwise use token_count
+            if 'enriched_tokens' in chunk:
+                chunk_tokens = chunk['enriched_tokens']
+            else:
+                chunk_tokens = chunk.get('metadata', {}).get('token_count', 0)
+                if chunk_tokens == 0:
+                    chunk_tokens = len(chunk.get('text', '')) // 4
+            
+            if cumulative_tokens + chunk_tokens <= target_total_tokens:
+                trimmed_chunks.append(chunk)
+                cumulative_tokens += chunk_tokens
+            else:
+                break
+        
+        original_count = len(chunks)
+        original_tokens = total_tokens
+        print(f"✂️ [{chunking_strategy}] Trimmed from {original_count} chunks ({original_tokens:.0f} tokens) to {len(trimmed_chunks)} chunks ({cumulative_tokens:.0f} tokens) to fit target {target_total_tokens} tokens")
+        
+        # Add summary
+        if trimmed_chunks:
+            trimmed_chunks[0]['_retrieval_summary'] = {
+                'total_chunks': len(trimmed_chunks),
+                'total_tokens': cumulative_tokens,
+                'target_total_tokens': target_total_tokens,
+                'avg_tokens_per_chunk': cumulative_tokens / len(trimmed_chunks) if trimmed_chunks else 0,
+                'trimmed': True,
+                'original_count': original_count,
+                'original_tokens': original_tokens
+            }
+        
+        return trimmed_chunks
+    
+    def search_qdrant(self, query: str, chunking_strategy: str, top_k: int = 20, 
+                      target_total_tokens: int = 4500, min_total_tokens: int = 3800) -> List[Dict]:
+        """
+        Search in Qdrant with chunking strategy filter and trim to target total tokens
+        Auto-retrieve more if under min_total_tokens
         
         Args:
             query: Search query
             chunking_strategy: Chunking strategy to filter
-            top_k: Number of results (initial)
-            min_total_tokens: Minimum total tokens to retrieve (if None, calculated as k * avg_chunk_tokens)
-            max_total_tokens: Maximum total tokens to retrieve (if set, will stop when reached)
-            avg_chunk_tokens: Average tokens per chunk for calculating min_total_tokens
+            top_k: Number of results to retrieve initially
+            target_total_tokens: Target total tokens (will trim if exceeded, default 4500)
+            min_total_tokens: Minimum total tokens (will retrieve more if under, default 3800)
         
         Returns:
-            List of retrieved chunks
+            List of retrieved chunks (trimmed to fit target_total_tokens)
         """
-        # Calculate min_total_tokens if not provided
-        if min_total_tokens is None:
-            min_total_tokens = top_k * avg_chunk_tokens
         
         # Encode query
         query_embedding = self.model.encode(
@@ -319,15 +409,107 @@ class EvaluationSystem:
                         match=MatchValue(value="child")
                     )
                 )
+            
+            # Special logic for parent_child: start with top_k=6
+            try:
+                current_limit = 6  # Start with 6 for parent-child
+                max_iterations = 15  # Safety limit
+                iteration = 0
+                
+                while iteration < max_iterations:
+                    # Retrieve chunks
+                    results = self.client.query_points(
+                        collection_name=COLLECTION_NAME,
+                        query=query_embedding,
+                        limit=current_limit,
+                        query_filter=search_filter,
+                        with_payload=True
+                    ).points
+                    
+                    # Convert to dict
+                    chunks = []
+                    for hit in results:
+                        chunk_data = {
+                            'chunk_id': hit.payload['chunk_id'],
+                            'text': hit.payload['text'],
+                            'score': float(hit.score),
+                            'category': hit.payload.get('category', ''),
+                            'metadata': hit.payload.get('metadata', {})
+                        }
+                        chunks.append(chunk_data)
+                    
+                    if len(chunks) == 0:
+                        break
+                    
+                    # Enrich with parent context
+                    print(f"✓ Retrieved {len(chunks)} child chunks (limit={current_limit})")
+                    chunks = self.enrich_parent_child_context(chunks)
+                    
+                    # Calculate tokens after enrichment
+                    enriched_total_tokens = sum(c.get('enriched_tokens', 0) for c in chunks)
+                    print(f"  Enriched to {enriched_total_tokens:.0f} tokens (avg {enriched_total_tokens/len(chunks):.0f} per chunk)")
+                    
+                    # Check token conditions (parent-child)
+                    if enriched_total_tokens < 3800:
+                        # Need more chunks - add 1 more
+                        if len(results) == current_limit and current_limit < 20:
+                            current_limit += 1
+                            print(f"  ⚠️ Only {enriched_total_tokens:.0f} tokens (< 3800), retrieving 1 more chunk (limit={current_limit})...")
+                            iteration += 1
+                            continue
+                        else:
+                            # Can't retrieve more
+                            print(f"  ⚠️ Only {enriched_total_tokens:.0f} tokens but no more chunks available")
+                            break
+                    elif enriched_total_tokens > 5000:
+                        # Too many tokens - truncate from end
+                        print(f"  ✂️ {enriched_total_tokens:.0f} tokens > 5000, truncating from end...")
+                        trimmed_chunks = []
+                        cumulative_tokens = 0
+                        for chunk in chunks:
+                            chunk_tokens = chunk.get('enriched_tokens', 0)
+                            if cumulative_tokens + chunk_tokens <= 5000:
+                                trimmed_chunks.append(chunk)
+                                cumulative_tokens += chunk_tokens
+                            else:
+                                break
+                        chunks = trimmed_chunks
+                        print(f"  ✂️ Truncated to {len(chunks)} chunks ({cumulative_tokens:.0f} tokens)")
+                        break
+                    else:
+                        # In range [3800, 5000] - perfect!
+                        print(f"  ✓ {enriched_total_tokens:.0f} tokens in target range [3800, 5000]")
+                        break
+                    
+                    iteration += 1
+                
+                # Add summary
+                if chunks:
+                    final_tokens = sum(c.get('enriched_tokens', 0) for c in chunks)
+                    chunks[0]['_retrieval_summary'] = {
+                        'total_chunks': len(chunks),
+                        'total_tokens': final_tokens,
+                        'target_total_tokens': target_total_tokens,
+                        'avg_tokens_per_chunk': final_tokens / len(chunks) if chunks else 0
+                    }
+                
+                return chunks
+                
+            except Exception as e:
+                print(f"⚠️ Error querying Qdrant for parent_child strategy: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
         
-        # Start with initial top_k
-        current_limit = top_k
-        chunks = []
-        total_tokens = 0
-        previous_count = 0
-        
+        # For non-parent_child strategies, use standard logic
         try:
-            while True:
+            # Start with initial top_k
+            current_limit = top_k
+            max_retries = 2
+            retry_count = 0
+            
+            while retry_count <= max_retries:
+                # Retrieve chunks
                 results = self.client.query_points(
                     collection_name=COLLECTION_NAME,
                     query=query_embedding,
@@ -335,8 +517,8 @@ class EvaluationSystem:
                     query_filter=search_filter,
                     with_payload=True
                 ).points
-                
-                # Convert to dict
+            
+                # Convert to dict and calculate tokens
                 chunks = []
                 total_tokens = 0
                 
@@ -345,7 +527,6 @@ class EvaluationSystem:
                         'chunk_id': hit.payload['chunk_id'],
                         'text': hit.payload['text'],
                         'score': float(hit.score),
-                        'source_file': hit.payload.get('source_file', ''),
                         'category': hit.payload.get('category', ''),
                         'metadata': hit.payload.get('metadata', {})
                     }
@@ -357,61 +538,40 @@ class EvaluationSystem:
                         total_tokens += token_count
                     else:
                         # Estimate if not available (rough estimate: 1 token ≈ 4 chars)
-                        total_tokens += len(hit.payload['text']) // 4
+                        estimated = len(hit.payload['text']) // 4
+                        total_tokens += estimated
                 
-                # Check if we have enough tokens
-                if total_tokens >= min_total_tokens:
-                    # We have enough tokens
-                    break
+                print(f"📊 [{chunking_strategy}] Retrieved {len(chunks)} chunks, Total tokens: {total_tokens:.0f} (limit={current_limit})")
+                if chunks:
+                    print(f"   First chunk: {chunks[0]['chunk_id'][:60]}... ({chunks[0].get('metadata', {}).get('token_count', 'N/A')} tokens)")
                 
-                # Check if we exceeded max tokens (if set)
-                if max_total_tokens and total_tokens >= max_total_tokens:
-                    # Trim chunks to fit max_total_tokens
-                    trimmed_chunks = []
-                    cumulative_tokens = 0
-                    for chunk in chunks:
-                        chunk_tokens = chunk.get('metadata', {}).get('token_count', 0) or len(chunk['text']) // 4
-                        if cumulative_tokens + chunk_tokens <= max_total_tokens:
-                            trimmed_chunks.append(chunk)
-                            cumulative_tokens += chunk_tokens
-                        else:
-                            break
-                    chunks = trimmed_chunks
-                    total_tokens = cumulative_tokens
-                    print(f"✂️ Trimmed to {len(chunks)} chunks ({total_tokens} tokens) to fit max_total_tokens={max_total_tokens}")
-                    break
+                # Debug: Check auto-retrieve conditions
+                need_more_tokens = total_tokens < min_total_tokens
+                can_retry = retry_count < max_retries
+                has_more_chunks = len(results) == current_limit
                 
-                # Check if we got more results than previous iteration
-                if len(results) == previous_count:
-                    # No more results available, even with increased limit
-                    print(f"⚠️ Could only retrieve {len(results)} chunks ({total_tokens} tokens) - "
-                          f"target was {min_total_tokens} tokens. May indicate limited data in collection.")
-                    break
+                if need_more_tokens:
+                    print(f"   ⚠️ Need more tokens: {total_tokens:.0f} < {min_total_tokens}")
+                    print(f"      Can retry: {can_retry} (retry_count={retry_count}/{max_retries})")
+                    print(f"      Has more chunks: {has_more_chunks} (len(results)={len(results)} vs limit={current_limit})")
                 
-                # Check if we reached the result count (might have more with higher limit)
-                if len(results) < current_limit:
-                    # We got fewer results than requested - this is max available
-                    print(f"⚠️ Retrieved all available {len(results)} chunks ({total_tokens} tokens) - "
-                          f"target was {min_total_tokens} tokens.")
-                    break
-                
-                # Need more chunks - increase limit
-                previous_count = len(results)
-                current_limit = int(current_limit * 1.5)
-                
-                # Safety limit to prevent infinite loop
-                if current_limit > 100:
-                    print(f"⚠️ Reached safety limit (100 chunks), stopping at {len(results)} chunks ({total_tokens} tokens)")
+                # Check if we need more chunks
+                # if need_more_tokens and can_retry and has_more_chunks:
+                if need_more_tokens:
+                    # Try retrieving more
+                    retry_count += 1
+                    new_limit = min(current_limit + 5, 30)  # Increase by 5, max 30 (increased from 20)
+                    print(f"   🔄 Auto-retrieving more chunks with limit={new_limit}...")
+                    current_limit = new_limit
+                    continue
+                else:
+                    # Done retrieving
+                    if need_more_tokens and not has_more_chunks:
+                        print(f"   ⚠️ Stopped at {total_tokens:.0f} tokens (no more chunks available)")
                     break
             
-            if len(chunks) > 0:
-                # Add summary to first chunk for logging
-                chunks[0]['_retrieval_summary'] = {
-                    'total_chunks': len(chunks),
-                    'total_tokens': total_tokens,
-                    'min_total_tokens_target': min_total_tokens,
-                    'avg_tokens_per_chunk': total_tokens / len(chunks) if chunks else 0
-                }
+            # Trim to target using helper method
+            chunks = self.trim_chunks_to_target(chunks, target_total_tokens, chunking_strategy)
         
         except Exception as e:
             print(f"⚠️ Error querying Qdrant for strategy '{chunking_strategy}': {e}")
@@ -422,37 +582,9 @@ class EvaluationSystem:
         if len(chunks) == 0:
             print(f"⚠️ No chunks found for strategy: {chunking_strategy}")
             print(f"   Filter used: chunking_strategy={chunking_strategy}")
-            if chunking_strategy == "parent_child":
-                print(f"   Also filtered by: metadata.role=child")
             return []
         
-        # Enrich parent-child chunks with full context
-        if chunking_strategy == "parent_child":
-            print(f"✓ Retrieved {len(chunks)} chunks ({total_tokens} tokens)")
-            # Debug: Check what we actually retrieved
-            if chunks:
-                sample_ids = [c['chunk_id'] for c in chunks[:3]]
-                print(f"  Sample chunk IDs BEFORE enrichment: {sample_ids}")
-            
-            print(f"  Enriching with parent/child context...")
-            chunks = self.enrich_parent_child_context(chunks)
-            
-            # Debug: Check after enrichment
-            if chunks:
-                sample_ids_after = [c['chunk_id'] for c in chunks[:3]]
-                print(f"  Sample chunk IDs AFTER enrichment: {sample_ids_after}")
-            
-            # Recalculate total tokens after enrichment
-            enriched_total_tokens = sum(c.get('enriched_tokens', 0) for c in chunks)
-            print(f"✓ Enriched to {enriched_total_tokens} tokens total (avg {enriched_total_tokens/len(chunks):.0f} per chunk)")
-            
-            # Update summary with enriched tokens
-            if chunks and '_retrieval_summary' in chunks[0]:
-                chunks[0]['_retrieval_summary']['total_tokens_enriched'] = enriched_total_tokens
-                chunks[0]['_retrieval_summary']['avg_tokens_per_chunk_enriched'] = enriched_total_tokens / len(chunks)
-        else:
-            print(f"✓ Retrieved {len(chunks)} chunks ({total_tokens} tokens) for query with strategy '{chunking_strategy}'")
-        
+        # Return chunks (already trimmed above for non-parent_child strategies)
         return chunks
     
     def get_ground_truth_chunks_text(self, relevant_chunks: List[Dict], chunking_strategy: str) -> Dict[str, Dict]:
@@ -495,7 +627,6 @@ class EvaluationSystem:
                     chunk_data = results[0].payload
                     ground_truth_map[chunk_id] = {
                         'text': chunk_data.get('text', ''),
-                        'source_file': chunk_data.get('source_file', ''),
                         'relevance': rel_chunk.get('relevance', 'high'),
                         'strategy': chunk_data.get('chunking_strategy', 'unknown')
                     }
@@ -503,7 +634,6 @@ class EvaluationSystem:
                     # Chunk not found
                     ground_truth_map[chunk_id] = {
                         'text': '',
-                        'source_file': '',
                         'relevance': rel_chunk.get('relevance', 'high'),
                         'not_found': True
                     }
@@ -511,7 +641,6 @@ class EvaluationSystem:
                 print(f"Warning: Could not fetch ground truth chunk {chunk_id}: {e}")
                 ground_truth_map[chunk_id] = {
                     'text': '',
-                    'source_file': '',
                     'relevance': rel_chunk.get('relevance', 'high'),
                     'error': str(e)
                 }
@@ -584,8 +713,6 @@ class EvaluationSystem:
                 # For other strategies
                 ret_text = ret_chunk.get('text', '')
             
-            ret_source = ret_chunk.get('source_file', '')
-            
             matched = False
             best_match = None
             best_overlap = 0.0
@@ -604,13 +731,6 @@ class EvaluationSystem:
                         continue
                     
                     gt_text = gt_data.get('text', '')
-                    gt_source = gt_data.get('source_file', '')
-                    
-                    # Must be from same source file
-                    if not gt_source or not ret_source:
-                        continue
-                    if gt_source != ret_source:
-                        continue
                     
                     if not gt_text or not ret_text:
                         continue
@@ -656,13 +776,14 @@ class EvaluationSystem:
                 if is_parent_chunk:
                     # Lower threshold for parent chunks since they're much larger
                     # Even 20% containment means significant overlap
-                    match_threshold = 0.2  # Lowered from 0.30 to 0.20
+                    match_threshold = 0.3  # Lowered from 0.30 to 0.20
                 elif is_child_chunk:
                     # Normal threshold for child chunks
-                    match_threshold = 0.1
+                    match_threshold = 0.2
                 else:
                     # Normal threshold for other strategies
-                    match_threshold = 0.1
+                    match_threshold = 0.2
+                match_threshold = 0
                 
                 if best_match and best_overlap > match_threshold:
                     relevance = best_match[1]
@@ -734,13 +855,14 @@ class EvaluationSystem:
                 if is_parent_chunk:
                     # Lower threshold for parent chunks since they're much larger
                     # Even 20% containment means significant overlap
-                    match_threshold = 0.2
+                    match_threshold = 0.3
                 elif is_child_chunk:
                     # Normal threshold for child chunks
-                    match_threshold = 0.1
+                    match_threshold = 0.2
                 else:
                     # Normal threshold for other strategies
-                    match_threshold = 0.1
+                    match_threshold = 0.2
+                match_threshold= 0
                 
                 if best_match and best_overlap > match_threshold:
                     relevance = best_match[1]
@@ -832,10 +954,15 @@ class EvaluationSystem:
         return metrics
     
     def run_evaluation(self, chunking_strategy: str, retrieval_method: str, 
-                      top_k: int = 10, min_total_tokens: int = None, max_total_tokens: int = None,
-                      progress=gr.Progress()) -> Tuple[str, pd.DataFrame, str]:
+                      top_k: int = 20, target_total_tokens: int = 4500, min_total_tokens: int = 3800,
+                      use_multivector: bool = False,
+                      progress=gr.Progress()) -> Tuple[str, pd.DataFrame, str, go.Figure, pd.DataFrame]:
+        # Auto-load evaluation file for the selected chunking strategy
+        load_status = self.set_evaluation_file(chunking_strategy)
+        print(load_status)
+        
         if not self.queries:
-            return "No evaluation queries loaded!", pd.DataFrame(), "{}", self.generate_comparison_heatmap()
+            return f"No evaluation queries loaded for {chunking_strategy}!", pd.DataFrame(), "{}", self.generate_comparison_heatmap(), self.generate_strategy_summary_table()
         
         results = []
         all_metrics = []
@@ -849,194 +976,253 @@ class EvaluationSystem:
             relevant_chunks = query_item.get('relevant_chunks', [])
             
             # Choose retrieval method
-            if retrieval_method == "parent" and chunking_strategy == "parent_child":
-                # Use ParentRetrieval for parent-child strategy
-                if self.parent_retrieval:
-                    try:
-                        parent_results = self.parent_retrieval.search(query_text, top_k=top_k)
-                        # Convert to standard format
-                        retrieved_chunks = []
-                        for pr in parent_results:
-                            # Need to get source_file from the parent chunk
-                            parent_id = pr['parent_id']
+            # Apply multivector (ColBERT) reranking if enabled
+            # if use_multivector and self.multivector_retrieval:
+            #     # Use MultivectorRetrieval with reranking
+            #     try:
+            #         print(f"🔍 Using MultivectorRetrieval (ColBERT reranking)")
+            #         multivector_results = self.multivector_retrieval.search(
+            #             query=query_text,
+            #             chunking_strategy=chunking_strategy,
+            #             top_k=top_k,
+            #             use_reranking=True
+            #         )
+            #         # Trim to target tokens
+            #         retrieved_chunks = self.trim_chunks_to_target(multivector_results, target_total_tokens, chunking_strategy)
+            #     except Exception as e:
+            #         print(f"⚠️ Error using MultivectorRetrieval: {e}")
+            #         import traceback
+            #         traceback.print_exc()
+            #         # Fallback to standard retrieval
+            #         use_multivector = False
+            
+            if not use_multivector or not self.multivector_retrieval:
+                # Standard retrieval methods
+                if retrieval_method == "parent" and chunking_strategy == "parent_child":
+                    # Use ParentRetrieval for parent-child strategy
+                    if self.parent_retrieval:
+                        try:
+                            # Start with initial top_k, retry if not enough tokens
+                            current_k = top_k
+                            max_retries = 2
+                            retry_count = 0
+                            temp_chunks = []
                             
-                            # Fetch parent chunk details
-                            try:
-                                from qdrant_client.models import Filter, FieldCondition, MatchValue
-                                parent_filter = Filter(
-                                    must=[
-                                        FieldCondition(
-                                            key="chunk_id",
-                                            match=MatchValue(value=parent_id)
+                            while retry_count <= max_retries:
+                                parent_results = self.parent_retrieval.search(query_text, top_k=current_k)
+                                # Convert to standard format
+                                temp_chunks = []
+                                total_tokens = 0
+                                
+                                for pr in parent_results:
+                                    # Need to get source_file from the parent chunk
+                                    parent_id = pr['parent_id']
+                                    
+                                    # Fetch parent chunk details
+                                    try:
+                                        from qdrant_client.models import Filter, FieldCondition, MatchValue
+                                        parent_filter = Filter(
+                                            must=[
+                                                FieldCondition(
+                                                    key="chunk_id",
+                                                    match=MatchValue(value=parent_id)
+                                                )
+                                            ]
                                         )
-                                    ]
-                                )
+                                        
+                                        parent_details = self.client.scroll(
+                                            collection_name=COLLECTION_NAME,
+                                            scroll_filter=parent_filter,
+                                            limit=1,
+                                            with_payload=True
+                                        )[0]
+                                        
+                                        if parent_details:
+                                            parent_payload = parent_details[0].payload
+                                            source_file = parent_payload.get('source_file', '')
+                                            category = parent_payload.get('category', '')
+                                        else:
+                                            source_file = ''
+                                            category = ''
+                                    except:
+                                        source_file = ''
+                                        category = ''
+                                    
+                                    enriched_tokens = int(len(pr['context'].split()) * 1.3)
+                                    total_tokens += enriched_tokens
+                                    
+                                    temp_chunks.append({
+                                        'chunk_id': parent_id,
+                                        'text': pr['context'],
+                                        'score': pr['retrieval_score'],
+                                        'source_file': source_file,
+                                        'category': category,
+                                        'metadata': {
+                                            'num_child_hits': pr['num_child_hits'],
+                                            'retrieval_method': 'parent',
+                                            'token_count': enriched_tokens
+                                        },
+                                        'enriched_text': pr['context'],
+                                        'enriched_tokens': enriched_tokens
+                                    })
                                 
-                                parent_details = self.client.scroll(
-                                    collection_name=COLLECTION_NAME,
-                                    scroll_filter=parent_filter,
-                                    limit=1,
-                                    with_payload=True
-                                )[0]
-                                
-                                if parent_details:
-                                    parent_payload = parent_details[0].payload
-                                    source_file = parent_payload.get('source_file', '')
-                                    category = parent_payload.get('category', '')
+                                # Check if we need more chunks
+                                # if total_tokens < min_total_tokens and retry_count < max_retries and len(parent_results) == current_k:
+                                if total_tokens < min_total_tokens:
+                                    retry_count += 1
+                                    new_k = min(current_k + 5, 20)  # Increase by 3 for parent (larger chunks)
+                                    print(f"⚠️ [ParentRetrieval] Only {total_tokens:.0f} tokens (< {min_total_tokens}), retrieving more with top_k={new_k}...")
+                                    current_k = new_k
+                                    continue
                                 else:
-                                    source_file = ''
-                                    category = ''
-                            except:
-                                source_file = ''
-                                category = ''
+                                    # Done retrieving
+                                    break
                             
-                            retrieved_chunks.append({
-                                'chunk_id': parent_id,
-                                'text': pr['context'],
-                                'score': pr['retrieval_score'],
-                                'source_file': source_file,
-                                'category': category,
-                                'metadata': {
-                                    'num_child_hits': pr['num_child_hits'],
-                                    'retrieval_method': 'parent',
-                                    'token_count': int(len(pr['context'].split()) * 1.3)  # Rough estimate
-                                },
-                                'enriched_text': pr['context'],
-                                'enriched_tokens': int(len(pr['context'].split()) * 1.3)
-                            })
-                    except Exception as e:
-                        print(f"⚠️ Error using ParentRetrieval: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Fallback to dense search
+                            # Trim to target tokens
+                            retrieved_chunks = self.trim_chunks_to_target(temp_chunks, target_total_tokens, chunking_strategy)
+                        except Exception as e:
+                            print(f"⚠️ Error using ParentRetrieval: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Fallback to dense search
+                            retrieved_chunks = self.search_qdrant(
+                                query_text, 
+                                chunking_strategy, 
+                                top_k=top_k,
+                                target_total_tokens=target_total_tokens,
+                                min_total_tokens=min_total_tokens
+                            )
+                    else:
+                        print("⚠️ ParentRetrieval not available, using dense search")
                         retrieved_chunks = self.search_qdrant(
                             query_text, 
                             chunking_strategy, 
                             top_k=top_k,
-                            min_total_tokens=min_total_tokens,
-                            max_total_tokens=max_total_tokens
+                            target_total_tokens=target_total_tokens,
+                            min_total_tokens=min_total_tokens
                         )
-                else:
-                    print("⚠️ ParentRetrieval not available, using dense search")
-                    retrieved_chunks = self.search_qdrant(
-                        query_text, 
-                        chunking_strategy, 
-                        top_k=top_k,
-                        min_total_tokens=min_total_tokens,
-                        max_total_tokens=max_total_tokens
-                    )
-            elif retrieval_method == "dense":
-                # Use DenseRetrieval
-                if self.dense_retrieval:
-                    try:
-                        dense_results = self.dense_retrieval.search(
-                            query_text, 
-                            chunking_strategy=chunking_strategy,
-                            top_k=top_k
-                        )
-                        retrieved_chunks = dense_results
-                    except Exception as e:
-                        print(f"⚠️ Error using DenseRetrieval: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Fallback to search_qdrant
+                elif retrieval_method == "dense":
+                    # Use DenseRetrieval
+                    if self.dense_retrieval:
+                        try:
+                            dense_results = self.dense_retrieval.search(
+                                query_text, 
+                                chunking_strategy=chunking_strategy,
+                                top_k=top_k
+                            )
+                            # Trim to target tokens
+                            retrieved_chunks = self.trim_chunks_to_target(dense_results, target_total_tokens, chunking_strategy)
+                        except Exception as e:
+                            print(f"⚠️ Error using DenseRetrieval: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Fallback to search_qdrant
+                            retrieved_chunks = self.search_qdrant(
+                                query_text, 
+                                chunking_strategy, 
+                                top_k=top_k,
+                                target_total_tokens=target_total_tokens,
+                                min_total_tokens=min_total_tokens
+                            )
+                    else:
+                        print("⚠️ DenseRetrieval not available, using search_qdrant")
                         retrieved_chunks = self.search_qdrant(
                             query_text, 
                             chunking_strategy, 
                             top_k=top_k,
-                            min_total_tokens=min_total_tokens,
-                            max_total_tokens=max_total_tokens
+                            target_total_tokens=target_total_tokens,
+                            min_total_tokens=min_total_tokens
                         )
-                else:
-                    print("⚠️ DenseRetrieval not available, using search_qdrant")
-                    retrieved_chunks = self.search_qdrant(
-                        query_text, 
-                        chunking_strategy, 
-                        top_k=top_k,
-                        min_total_tokens=min_total_tokens,
-                        max_total_tokens=max_total_tokens
-                    )
-            elif retrieval_method == "sparse":
-                # Use SparseRetrieval
-                if self.sparse_retrieval:
-                    try:
-                        sparse_results = self.sparse_retrieval.search(
-                            query_text, 
-                            chunking_strategy=chunking_strategy,
-                            top_k=top_k
-                        )
-                        retrieved_chunks = sparse_results
-                    except Exception as e:
-                        print(f"⚠️ Error using SparseRetrieval: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Fallback to search_qdrant
+                elif retrieval_method == "sparse":
+                    # Use SparseRetrieval
+                    if self.sparse_retrieval:
+                        try:
+                            sparse_results = self.sparse_retrieval.search(
+                                query_text, 
+                                chunking_strategy=chunking_strategy,
+                                top_k=top_k
+                            )
+                            # Trim to target tokens
+                            retrieved_chunks = self.trim_chunks_to_target(sparse_results, target_total_tokens, chunking_strategy)
+                        except Exception as e:
+                            print(f"⚠️ Error using SparseRetrieval: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Fallback to search_qdrant
+                            retrieved_chunks = self.search_qdrant(
+                                query_text, 
+                                chunking_strategy, 
+                                top_k=top_k,
+                                target_total_tokens=target_total_tokens,
+                                min_total_tokens=min_total_tokens
+                            )
+                    else:
+                        print("⚠️ SparseRetrieval not available, using search_qdrant")
                         retrieved_chunks = self.search_qdrant(
                             query_text, 
                             chunking_strategy, 
                             top_k=top_k,
-                            min_total_tokens=min_total_tokens,
-                            max_total_tokens=max_total_tokens
+                            target_total_tokens=target_total_tokens,
+                            min_total_tokens=min_total_tokens
                         )
-                else:
-                    print("⚠️ SparseRetrieval not available, using search_qdrant")
-                    retrieved_chunks = self.search_qdrant(
-                        query_text, 
-                        chunking_strategy, 
-                        top_k=top_k,
-                        min_total_tokens=min_total_tokens,
-                        max_total_tokens=max_total_tokens
-                    )
-            elif retrieval_method == "hybrid":
-                # Use HybridRetrieval
-                if self.hybrid_retrieval:
-                    try:
-                        hybrid_results = self.hybrid_retrieval.search(
-                            query_text, 
-                            chunking_strategy=chunking_strategy,
-                            top_k=top_k
-                        )
-                        retrieved_chunks = hybrid_results
-                    except Exception as e:
-                        print(f"⚠️ Error using HybridRetrieval: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Fallback to search_qdrant
+                elif retrieval_method == "hybrid":
+                    # Use HybridRetrieval
+                    if self.hybrid_retrieval:
+                        try:
+                            hybrid_results = self.hybrid_retrieval.search(
+                                query_text, 
+                                chunking_strategy=chunking_strategy,
+                                top_k=top_k
+                            )
+                            # Trim to target tokens
+                            retrieved_chunks = self.trim_chunks_to_target(hybrid_results, target_total_tokens, chunking_strategy)
+                        except Exception as e:
+                            print(f"⚠️ Error using HybridRetrieval: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # Fallback to search_qdrant
+                            retrieved_chunks = self.search_qdrant(
+                                query_text, 
+                                chunking_strategy, 
+                                top_k=top_k,
+                                target_total_tokens=target_total_tokens,
+                                min_total_tokens=min_total_tokens
+                            )
+                    else:
+                        print("⚠️ HybridRetrieval not available, using search_qdrant")
                         retrieved_chunks = self.search_qdrant(
                             query_text, 
                             chunking_strategy, 
                             top_k=top_k,
-                            min_total_tokens=min_total_tokens,
-                            max_total_tokens=max_total_tokens
+                            target_total_tokens=target_total_tokens,
+                            min_total_tokens=min_total_tokens
                         )
                 else:
-                    print("⚠️ HybridRetrieval not available, using search_qdrant")
+                    # Use standard dense search (fallback)
                     retrieved_chunks = self.search_qdrant(
                         query_text, 
                         chunking_strategy, 
                         top_k=top_k,
-                        min_total_tokens=min_total_tokens,
-                        max_total_tokens=max_total_tokens
+                        target_total_tokens=target_total_tokens,
+                        min_total_tokens=min_total_tokens
                     )
-            else:
-                # Use standard dense search (fallback)
-                retrieved_chunks = self.search_qdrant(
-                    query_text, 
-                    chunking_strategy, 
-                    top_k=top_k,
-                    min_total_tokens=min_total_tokens,
-                    max_total_tokens=max_total_tokens
-                )
             
             if len(retrieved_chunks) == 0:
                 queries_with_no_results += 1
+                print(f"❌ No chunks retrieved for this query!")
             else:
                 total_chunks_retrieved += len(retrieved_chunks)
                 
                 # Extract retrieval summary if available
+                query_tokens = 0
                 if '_retrieval_summary' in retrieved_chunks[0]:
                     summary = retrieved_chunks[0]['_retrieval_summary']
-                    total_tokens_retrieved += summary['total_tokens']
+                    # For parent_child strategy, use enriched tokens for fair comparison
+                    if 'total_tokens_enriched' in summary:
+                        query_tokens = summary['total_tokens_enriched']
+                    else:
+                        query_tokens = summary['total_tokens']
+                    total_tokens_retrieved += query_tokens
                 else:
                     # Fallback: calculate from enriched_tokens or estimate
                     for chunk in retrieved_chunks:
@@ -1044,7 +1230,17 @@ class EvaluationSystem:
                         tokens = chunk.get('enriched_tokens') or \
                                 chunk.get('metadata', {}).get('token_count') or \
                                 len(chunk.get('text', '')) // 4
-                        total_tokens_retrieved += tokens
+                        query_tokens += tokens
+                    total_tokens_retrieved += query_tokens
+                
+                print(f"✅ Retrieved {len(retrieved_chunks)} chunks, {query_tokens:.0f} tokens for this query")
+                if len(retrieved_chunks) > 0:
+                    avg_tok = query_tokens / len(retrieved_chunks)
+                    print(f"   Avg tokens/chunk: {avg_tok:.1f}")
+                    # Show first 3 chunks
+                    for idx, chunk in enumerate(retrieved_chunks[:3]):
+                        chunk_tokens = chunk.get('enriched_tokens') or chunk.get('metadata', {}).get('token_count') or len(chunk.get('text', '')) // 4
+                        print(f"   Chunk {idx+1}: {chunk['chunk_id'][:60]}... ({chunk_tokens} tokens)")
             
             # Calculate metrics
             metrics = self.calculate_metrics(retrieved_chunks, relevant_chunks)
@@ -1066,7 +1262,7 @@ class EvaluationSystem:
                 'retrieval_method': retrieval_method,
                 'timestamp': datetime.now().isoformat(),
                 'metrics': metrics,
-                'retrieved_chunks': retrieved_chunks[:5],  # Top 5 for display
+                'retrieved_chunks': retrieved_chunks[:2],  # Top 5 for display
                 'retrieval_stats': {
                     'total_chunks': len(retrieved_chunks),
                     'total_tokens': retrieved_chunks[0].get('_retrieval_summary', {}).get('total_tokens', 0) if retrieved_chunks else 0,
@@ -1089,10 +1285,8 @@ class EvaluationSystem:
         summary += f"- Chunking Strategy: **{chunking_strategy}**\n"
         summary += f"- Retrieval Method: **{retrieval_method}**\n"
         summary += f"- Total Queries: **{len(self.queries)}**\n"
-        summary += f"- Top-K: **{top_k}**\n"
-        
-        if min_total_tokens:
-            summary += f"- Min Total Tokens: **{min_total_tokens}** (for fair comparison)\n"
+        summary += f"- Top-K: **{top_k}** (initial, auto-retrieve more if needed)\n"
+        summary += f"- Target Tokens: **{min_total_tokens} - {target_total_tokens}** (min-max range)\n"
         
         # Add retrieval statistics
         # avg_chunks_per_query = total_chunks_retrieved / len(self.queries) if self.queries else 0
@@ -1144,14 +1338,10 @@ class EvaluationSystem:
         strategy_key = f"{chunking_strategy}+{retrieval_method}"
         self.comparison_results[strategy_key] = {
             'metrics': avg_metrics,
-            # 'sum_tokens': total_tokens_retrieved,
-            # 'sum_chunks': total_chunks_retrieved,
-            # 'avg_chunks_per_query': avg_chunks_per_query,
             'avg_tokens_per_query': avg_tokens_per_query,
             'timestamp': datetime.now().isoformat(),
             'top_k': top_k,
-            'min_total_tokens': min_total_tokens,
-            'max_total_tokens': max_total_tokens
+            'target_total_tokens': target_total_tokens
         }
         
         # Generate comparison heatmap and strategy table
@@ -1160,22 +1350,22 @@ class EvaluationSystem:
         
         return summary, df, detailed_results, comparison_fig, strategy_table
     
-    def run_all_evaluations(self, top_k: int = 10, min_total_tokens: int = None, 
-                           max_total_tokens: int = None, progress=gr.Progress()) -> Tuple[str, pd.DataFrame, str]:
+    def run_all_evaluations(self, top_k: int = 20, target_total_tokens: int = 4500, 
+                           min_total_tokens: int = 3800, progress=gr.Progress()) -> Tuple[str, pd.DataFrame, str]:
         """
         Run all combinations of chunking strategies and retrieval methods
         Parent retrieval only runs with parent_child chunking
         
         Args:
-            top_k: Number of results to retrieve
-            min_total_tokens: Minimum total tokens
-            max_total_tokens: Maximum total tokens
+            top_k: Number of results to retrieve initially
+            target_total_tokens: Target total tokens (will trim if exceeded)
+            min_total_tokens: Minimum total tokens (will retrieve more if under)
             progress: Gradio progress tracker
         
         Returns:
             Summary text, comparison table, and detailed results
         """
-        chunking_strategies = ["fixed", "structure_paragraph", "hierarchical", "parent_child"]
+        chunking_strategies = ["fixed", "structure_paragraph", "hierarchical", "parent_child", "semantic"]
         all_retrieval_methods = ["dense", "hybrid"]
         
         # Calculate total combinations
@@ -1187,6 +1377,14 @@ class EvaluationSystem:
         completed = 0
         
         for chunking_strategy in chunking_strategies:
+            # Auto-load evaluation file for this chunking strategy
+            load_status = self.set_evaluation_file(chunking_strategy)
+            print(f"\n{load_status}")
+            
+            if not self.queries:
+                results_summary += f"⚠️ **{chunking_strategy}**: No evaluation file found, skipping...\n"
+                continue
+            
             # Determine retrieval methods for this chunking strategy
             if chunking_strategy == "parent_child":
                 retrieval_methods = all_retrieval_methods + ["parent"]
@@ -1210,8 +1408,8 @@ class EvaluationSystem:
                         chunking_strategy=chunking_strategy,
                         retrieval_method=retrieval_method,
                         top_k=top_k,
+                        target_total_tokens=target_total_tokens,
                         min_total_tokens=min_total_tokens,
-                        max_total_tokens=max_total_tokens,
                         progress=progress
                     )
                     
@@ -1392,8 +1590,7 @@ class EvaluationSystem:
         details += f"**Evaluation Information:**\n"
         details += f"- Timestamp: {strategy_data.get('timestamp', 'N/A')}\n"
         details += f"- Top-K: {strategy_data.get('top_k', 'N/A')}\n"
-        details += f"- Min Total Tokens: {strategy_data.get('min_total_tokens', 'N/A')}\n"
-        details += f"- Max Total Tokens: {strategy_data.get('max_total_tokens', 'N/A')}\n\n"
+        details += f"- Target Total Tokens: {strategy_data.get('target_total_tokens', 'N/A')}\n\n"
         
         # Retrieval statistics
         details += f"**Retrieval Statistics:**\n"
@@ -1410,17 +1607,27 @@ class EvaluationSystem:
         
         return details
     
-    def set_evaluation_file(self, category: str):
-        """Set evaluation file based on category"""
-        if category == "all":
-            self.evaluation_file = str(Path(EVALUATION_FOLDER) / "../evaluation.json")
-        else:
-            self.evaluation_file = str(Path(EVALUATION_FOLDER) / f"evaluation_{category}.json")
+    def set_evaluation_file(self, chunking_strategy: str):
+        """Set evaluation file based on chunking strategy
         
-        # Reload queries
+        Args:
+            chunking_strategy: The chunking strategy (fixed, hierarchical, parent_child, semantic, structure_paragraph)
+        
+        Returns:
+            Status message
+        """
+        # Map chunking strategy to evaluation file
+        # Pattern: {chunking_strategy}_evaluation_dataset.json
+        eval_file = Path(EVALUATION_FOLDER) / f"{chunking_strategy}_evaluation_dataset.json"
+        
+        if not eval_file.exists():
+            self.queries = []
+            return f"⚠️ Evaluation file not found: {eval_file.name}"
+        
+        self.evaluation_file = str(eval_file)
         self.load_evaluation_queries()
         
-        return f"✓ Loaded {len(self.queries)} queries from category: {category}"
+        return f"✓ Loaded {len(self.queries)} queries for {chunking_strategy} strategy"
     
     def clear_comparison(self):
         """Clear all comparison results"""
@@ -1431,7 +1638,7 @@ class EvaluationSystem:
         """Check how many chunks are available for each chunking strategy"""
         from qdrant_client.models import Filter, FieldCondition, MatchValue
         
-        strategies = ["fixed", "structure_paragraph", "hierarchical", "parent_child"]
+        strategies = ["fixed", "structure_paragraph", "hierarchical", "parent_child", "semantic"]
         availability_info = "**Data Availability in Qdrant**\n\n"
         
         try:
@@ -1499,73 +1706,85 @@ def create_dashboard():
     """Create Gradio dashboard"""
     
     with gr.Blocks(title="RAG Evaluation Dashboard", theme=gr.themes.Soft()) as demo:
-        gr.Markdown("Evaluation Dashboard")
+        gr.Markdown("""
+        # 🎯 RAG Evaluation Dashboard
+        Evaluate different chunking strategies and retrieval methods with various question types
+        """)
         
         with gr.Row():
             with gr.Column(scale=1):
-                gr.Markdown("### Configuration")
+                gr.Markdown("### 🧩 Chunking Strategy")
+                gr.Markdown("*Select chunking method - evaluation file will be loaded automatically*")
                 
-                # Category selector
-                category_selector = gr.Dropdown(
-                    choices=["doc", "document_law", "fiction", "all"],
-                    value="doc",
-                    label="📁 Evaluation Category",
-                    info="Select which dataset to evaluate"
-                )
-                
-                category_status = gr.Markdown("*Select a category to load evaluation queries*")
-                
-                chunking_strategy = gr.Dropdown(
-                    choices=["fixed", "structure_paragraph", "hierarchical", "parent_child"],
+                # Chunking strategy with Radio buttons
+                chunking_strategy = gr.Radio(
+                    choices=[
+                        ("📌 Fixed Size", "fixed"),
+                        ("📄 Structure Paragraph", "structure_paragraph"),
+                        ("🌳 Hierarchical", "hierarchical"),
+                        ("👨‍👧 Parent-Child", "parent_child"),
+                        ("🧠 Semantic", "semantic")
+                    ],
                     value="fixed",
-                    label="Chunking Strategy"
+                    label="Chunking Method",
+                    info="Each strategy has its own evaluation file with relevant chunks"
                 )
                 
-                retrieval_method = gr.Dropdown(
-                    choices=["dense", "sparse", "hybrid", "parent"],
+                strategy_status = gr.Markdown("*Evaluation file will load when you select a strategy*")
+                
+                gr.Markdown("---")
+                gr.Markdown("### 🔍 Retrieval Method")
+                gr.Markdown("*Select retrieval strategy*")
+                
+                retrieval_method = gr.Radio(
+                    choices=[
+                        ("🎯 Dense (Semantic)", "dense"),
+                        ("📝 Sparse (BM25)", "sparse"),
+                        ("⚡ Hybrid (Dense + Sparse)", "hybrid"),
+                        ("👨‍👧 Parent Retrieval", "parent")
+                    ],
                     value="dense",
-                    label="Retrieval Method"
+                    label="Retrieval Strategy",
+                    info="Parent retrieval only works with Parent-Child chunking"
                 )
                 
-                gr.Markdown("### Fair Comparison Settings")
+                gr.Markdown("---")
+                gr.Markdown("### 🚀 Advanced Options")
+                
+                # # Multivector retrieval checkbox
+                # use_multivector = gr.Checkbox(
+                #     label="🔬 Use ColBERT Multivector Reranking",
+                #     value=False,
+                #     info="Apply ColBERT late interaction for better ranking (slower but more accurate)"
+                # )
+                
+                gr.Markdown("---")
+                gr.Markdown("### ⚙️ Retrieval Settings")
                 
                 top_k = gr.Slider(
                     minimum=1,
                     maximum=30,
-                    value=10,
+                    value=12,
                     step=1,
-                    label="Top-K Results",
-                    info="Number of chunks to retrieve initially"
+                    label="Top-K Results (Initial)",
+                    info="Will auto-retrieve more if < 3800 tokens (up to +5 chunks)"
                 )
                 
-                min_total_tokens = gr.Number(
-                    value=2500,
-                    label="Min Total Tokens (0 = auto: top_k × 250)",
-                    info="For parent_child: enriched context will have more tokens"
+                target_total_tokens = gr.Number(
+                    value=4500,
+                    label="Target Total Tokens",
+                    info="Target tokens per query (auto-trim if exceeded for fair comparison)"
                 )
                 
-                max_total_tokens = gr.Number(
-                    value=4000,
-                    label="Max Total Tokens (0 = unlimited)",
-                    info="Stop retrieval when reaching this limit"
-                )
+                gr.Markdown("---")
                 
                 with gr.Row():
                     run_btn = gr.Button("🚀 RUN EVALUATION", variant="primary", size="lg")
-                    clear_btn = gr.Button("🗑️ Clear Comparison", variant="secondary", size="lg")
+                    clear_btn = gr.Button("🗑️ Clear Results", variant="secondary", size="lg")
                 
                 run_all_btn = gr.Button("⚡ RUN ALL COMBINATIONS", variant="primary", size="lg")
-                # gr.Markdown("*Runs all chunking strategies with all retrieval methods (parent retrieval only with parent_child)*")
+                gr.Markdown("*Runs all chunking strategies with all retrieval methods*")
                 
-                # check_data_btn = gr.Button("🔍 Check Data Availability", variant="secondary")
-                
-                # gr.Markdown("### System Info")
-                # gr.Markdown(f"- **Qdrant:** {QDRANT_HOST}:{QDRANT_PORT}")
-                # gr.Markdown(f"- **Collection:** {COLLECTION_NAME}")
-                # gr.Markdown(f"- **Model:** {MODEL_NAME}")
-                # gr.Markdown(f"- **Queries:** {len(eval_system.queries)}")
-
-                # data_status = gr.Markdown("Click 'Check Data Availability' to see chunk counts")
                 clear_status = gr.Textbox(label="Status", visible=False)
             
             with gr.Column(scale=2):
@@ -1593,33 +1812,30 @@ def create_dashboard():
                     )
         
         # Event handlers
-        category_selector.change(
-            fn=eval_system.set_evaluation_file,
-            inputs=[category_selector],
-            outputs=[category_status]
+        def update_evaluation_file(strategy):
+            return eval_system.set_evaluation_file(strategy)
+        
+        chunking_strategy.change(
+            fn=update_evaluation_file,
+            inputs=[chunking_strategy],
+            outputs=[strategy_status]
         )
         
-        def run_with_params(strategy, method, k, min_tokens, max_tokens):
-            # Convert 0 to None for auto calculation
-            min_tokens_val = None if min_tokens == 0 else int(min_tokens)
-            max_tokens_val = None if max_tokens == 0 else int(max_tokens)
-            return eval_system.run_evaluation(strategy, method, int(k), min_tokens_val, max_tokens_val)
+        def run_with_params(strategy, method, k, target_tokens, use_mv):
+            return eval_system.run_evaluation(strategy, method, int(k), int(target_tokens), 3800, use_mv)
         
         run_btn.click(
             fn=run_with_params,
-            inputs=[chunking_strategy, retrieval_method, top_k, min_total_tokens, max_total_tokens],
+            inputs=[chunking_strategy, retrieval_method, top_k, target_total_tokens], # tự thêm use_multivector
             outputs=[summary_output, table_output, json_output, comparison_plot, strategy_table]
         )
         
-        def run_all_with_params(k, min_tokens, max_tokens):
-            # Convert 0 to None for auto calculation
-            min_tokens_val = None if min_tokens == 0 else int(min_tokens)
-            max_tokens_val = None if max_tokens == 0 else int(max_tokens)
-            return eval_system.run_all_evaluations(int(k), min_tokens_val, max_tokens_val)
+        def run_all_with_params(k, target_tokens):
+            return eval_system.run_all_evaluations(int(k), int(target_tokens), 3800)
         
         run_all_btn.click(
             fn=run_all_with_params,
-            inputs=[top_k, min_total_tokens, max_total_tokens],
+            inputs=[top_k, target_total_tokens],
             outputs=[summary_output, table_output, json_output, comparison_plot, strategy_table]
         )
         

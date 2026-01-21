@@ -6,3 +6,5 @@ sentence-transformer
 torch
 tiktoken
 bm25
+fastembed
+kaleido

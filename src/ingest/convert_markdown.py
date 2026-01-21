@@ -66,7 +66,8 @@ def analyze_table_of_contents(md_text):
     
     # Check if has table of contents or introduction
     if not (re.search(r'MỤC LỤC', first_5_pages, re.IGNORECASE) or 
-            re.search(r'Lời giới thiệu', first_5_pages, re.IGNORECASE)):
+            re.search(r'Lời giới thiệu', first_5_pages, re.IGNORECASE)or 
+            re.search(r'NỘI DUNG', first_5_pages, re.IGNORECASE)):
         return None
     
     structure = {
@@ -108,6 +109,27 @@ def analyze_table_of_contents(md_text):
         if structure['main_level']:
             break
     
+    # If no main pattern found, check for uppercase headings
+    if structure['main_level'] is None:
+        # Find lines that are all uppercase and likely to be headings
+        uppercase_candidates = []
+        in_toc = False
+        for line in lines:
+            stripped = line.strip()
+            if re.search(r'MỤC LỤC|NỘI DUNG|Mục lục|Nội dung', stripped, re.IGNORECASE):
+                in_toc = True
+                continue
+            if in_toc and stripped and len(stripped) > 5:
+                # Check if line is mostly uppercase letters (excluding dots and spaces)
+                letters_only = re.sub(r'[^a-zA-ZÀ-ỹ]', '', stripped)
+                if letters_only and letters_only.isupper() and len(letters_only) >= 3:
+                    uppercase_candidates.append(stripped)
+                    if len(uppercase_candidates) >= 3:  # Found at least 3 uppercase headings
+                        structure['main_level'] = 'UPPERCASE'
+                        structure['main_numbering'] = 'none'
+                        structure['main_pattern'] = r'^[A-ZÀ-Ỹ][A-ZÀ-Ỹ\s]+[A-ZÀ-Ỹ]$'
+                        break
+    
     # Detect sub-level patterns
     sub_pattern_candidates = [
         (r'^\d+\.\d+', '1.1, 2.3 format'),  # 1.1, 2.3
@@ -140,6 +162,7 @@ def apply_toc_structure_to_markdown(md_text, toc_structure):
     lines = md_text.split('\n')
     new_lines = []
     i = 0
+    current_main_number = None  # Track current main section number
     
     while i < len(lines):
         line = lines[i]
@@ -156,6 +179,10 @@ def apply_toc_structure_to_markdown(md_text, toc_structure):
         if main_match:
             # For patterns like "PHẦN I", "Chương 1", etc.
             if toc_structure['main_level'] in ['PHẦN', 'Phần', 'CHƯƠNG', 'Chương']:
+                # Extract number/roman for tracking
+                number_part = main_match.group(1)
+                current_main_number = number_part
+                
                 new_lines.append(f"# {stripped}")
                 i += 1
                 # Check if next line should also be heading (e.g., uppercase title)
@@ -165,20 +192,63 @@ def apply_toc_structure_to_markdown(md_text, toc_structure):
                         new_lines.append(f"# {next_stripped}")
                         i += 1
                 continue
-            # For simple patterns like "I.", "1."
+            # For uppercase headings
+            elif toc_structure['main_level'] == 'UPPERCASE':
+                # Check if line is mostly uppercase
+                letters_only = re.sub(r'[^a-zA-ZÀ-ỹ]', '', stripped)
+                if letters_only and letters_only.isupper() and len(letters_only) >= 3:
+                    new_lines.append(f"# {stripped}")
+                    i += 1
+                    continue
+            # For simple patterns like "I.", "1.", "2.", "3."
+            elif toc_structure['main_level'] in ['Roman', 'Number']:
+                # Extract the number/roman part
+                number_part = main_match.group(1)
+                current_main_number = number_part
+                
+                new_lines.append(f"# {stripped}")
+                i += 1
+                continue
             else:
                 new_lines.append(f"# {stripped}")
                 i += 1
                 continue
         
-        # Check sub-level patterns
+        # Check sub-level patterns with parent relationship
         sub_matched = False
         for sub_pattern, _ in toc_structure['sub_patterns']:
             sub_match = re.match(sub_pattern, stripped)
             if sub_match:
-                new_lines.append(f"## {stripped}")
-                sub_matched = True
-                break
+                # For patterns like "3.1", "3.2" - check if parent is "3"
+                if re.match(r'^\d+\.\d+', stripped):
+                    parent_num = stripped.split('.')[0]
+                    # Only mark as sub-heading if it matches current main number
+                    if current_main_number and parent_num == current_main_number:
+                        new_lines.append(f"## {stripped}")
+                        sub_matched = True
+                        break
+                    # If no current main number or doesn't match, treat as potential main
+                    elif not current_main_number:
+                        new_lines.append(f"## {stripped}")
+                        sub_matched = True
+                        break
+                # For patterns like "I.1", "II.2" - check if parent is "I", "II"
+                elif re.match(r'^[IVXLCDM]+\.\d+', stripped):
+                    parts = stripped.split('.')
+                    parent_roman = parts[0]
+                    if current_main_number and parent_roman == current_main_number:
+                        new_lines.append(f"## {stripped}")
+                        sub_matched = True
+                        break
+                    elif not current_main_number:
+                        new_lines.append(f"## {stripped}")
+                        sub_matched = True
+                        break
+                # For other patterns, just apply sub-heading
+                else:
+                    new_lines.append(f"## {stripped}")
+                    sub_matched = True
+                    break
         
         if sub_matched:
             i += 1
@@ -204,7 +274,7 @@ def remove_table_of_contents(md_text, toc_structure):
     # Find TOC start position
     toc_start_idx = None
     for i, line in enumerate(lines):
-        if re.search(r'MỤC LỤC|Mục lục|MỤC\s*LỤC', line.strip(), re.IGNORECASE):
+        if re.search(r'MỤC LỤC|Mục lục|MỤC\s*LỤC|NỘI DUNG|Nội dung', line.strip(), re.IGNORECASE):
             toc_start_idx = i
             break
     
@@ -247,6 +317,11 @@ def remove_table_of_contents(md_text, toc_structure):
                 if current_match and current_match.group(1) == number_part:
                     second_occurrence_idx = i
                     break
+        elif toc_structure['main_level'] == 'UPPERCASE':
+            # For uppercase headings, match exact text or very similar
+            if stripped == first_main_item:
+                second_occurrence_idx = i
+                break
         else:
             # For simple patterns like "I.", "1."
             if stripped == first_main_item or stripped.startswith(first_main_item.split()[0]):

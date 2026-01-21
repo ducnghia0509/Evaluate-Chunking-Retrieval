@@ -146,8 +146,3 @@ def process_all_chunked_files():
 # ============== RUN ==============
 if __name__ == "__main__":
     stats = process_all_chunked_files()
-    
-    # Optionally, download the Embedd folder
-    # from google.colab import files
-    # !zip -r Embedd.zip {EMBEDD_DIR}
-    # files.download('Embedd.zip')
