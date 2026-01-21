@@ -30,6 +30,7 @@ Dự án này đánh giá hiệu quả của các phương pháp chunking và re
    - Child overlap: 50 tokens
 
 5. **Semantic Chunking**
+   - Sử dụng model BGE-m3 để tính toán và phân tách chunk
    - Chia dựa trên ngữ nghĩa của văn bản
    - Tự động xác định ranh giới semantic
 
@@ -51,6 +52,15 @@ Dự án này đánh giá hiệu quả của các phương pháp chunking và re
    - Retrieve ở cấp độ child chunks
    - Return ở cấp độ parent chunks
    - Aggregation: Max score
+
+## Bộ dữ liệu đánh giá
+
+Bộ đánh giá bao gồm **141 câu hỏi** được tạo từ các tài liệu tiếng Việt thuộc nhiều lĩnh vực khác nhau (văn bản pháp luật, tài liệu kỹ thuật, văn học). Bộ dữ liệu được thiết kế để đánh giá khả năng retrieval trong nhiều trường hợp:
+
+- **Câu hỏi đơn giản**: Câu trả lời nằm trong 1 chunk duy nhất
+- **Câu hỏi phức tạp**: Câu trả lời cần thông tin từ nhiều chunks khác nhau
+
+Mỗi câu hỏi được gắn nhãn với các chunk có chứa câu trả lời chính xác để tính toán các metrics đánh giá.
 
 ## Kết quả đánh giá
 
